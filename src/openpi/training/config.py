@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.kalmEE_policy as kalmEE_policy
+import openpi.policies.bimanual_policy as bimanual_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -337,6 +338,49 @@ class LeRobotKalmDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotBimanualDataConfig(DataConfigFactory):
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Make inputs look like they come from the Libero environment
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Prepare data for policy training
+        # Convert images to uint8 numpy arrays, add masks
+        data_transforms = _transforms.Group(
+            inputs=[bimanual_policy.EEInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[bimanual_policy.EEOutputs()],
+        )
+        # Use absolute for all 20 dims
+        delta_action_mask = _transforms.make_bool_mask(-20)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -573,6 +617,37 @@ _CONFIGS = [
         model=pi0_fast.Pi0FASTConfig(action_dim=10, action_horizon=10, max_token_len=180),
         data=LeRobotKalmDataConfig(
              repo_id="xiaolinf/kalmee",
+             base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+    ),
+    #### Rainbow Finetune
+    # LoRA
+    TrainConfig(
+        name="pi0_fast_bimanual_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotBimanualDataConfig(
+             repo_id="xiaolinf/bimanual",
+             base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_00,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=20, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Inference
+    TrainConfig(
+        name="pi0_fast_bimanual",
+        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=10, max_token_len=180),
+        data=LeRobotBimanualDataConfig(
+             repo_id="xiaolinf/bimanual",
              base_config=DataConfig(
                 local_files_only=True,
                 prompt_from_task=True,
