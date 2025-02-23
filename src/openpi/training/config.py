@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.kalmEE_policy as kalmEE_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -293,6 +294,49 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotKalmDataConfig(DataConfigFactory):
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Make inputs look like they come from the Libero environment
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",   # 3 + 6 + 1 end effector pose
+                        "actions": "actions",           # dim 10
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Prepare data for policy training
+        # Convert images to uint8 numpy arrays, add masks
+        data_transforms = _transforms.Group(
+            inputs=[kalmEE_policy.EEInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[kalmEE_policy.EEOutputs()],
+        )
+        # Use absolute for all 10 dims
+        delta_action_mask = _transforms.make_bool_mask(-10)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -327,7 +371,7 @@ class TrainConfig:
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 16
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -465,6 +509,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
+        batch_size=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
         freeze_filter=pi0.Pi0Config(
@@ -501,6 +546,38 @@ _CONFIGS = [
             action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+
+    #### Franka Finetune
+    # LoRA
+    TrainConfig(
+        name="pi0_fast_kalmee_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(action_dim=10, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotKalmDataConfig(
+             repo_id="xiaolinf/kalmee",
+             base_config=DataConfig(
+                local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_00,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=10, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Inference
+    TrainConfig(
+        name="pi0_fast_kalmee",
+        model=pi0_fast.Pi0FASTConfig(action_dim=10, action_horizon=10, max_token_len=180),
+        data=LeRobotKalmDataConfig(
+             repo_id="xiaolinf/kalmee",
+             base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
     ),
     #
     # Fine-tuning Aloha configs.
